@@ -1,16 +1,16 @@
 /**
- * Pievo Sandbox Extension
+ * Pi Sandbox Extension
  *
  * Lightweight sandboxing for Pi Agent without replacing built-in tools.
  *
  * - bash is sandboxed by mutating the built-in bash tool input after the model
  *   requests the tool and before Pi executes it.
- * - write/edit are blocked when they target paths outside the workspace or the
- *   system temp directory.
- * - read/search/list tools are blocked for sensitive home-directory paths.
- * - /sandbox shows or toggles the runtime sandbox state in the Pi TUI.
+ * - write/edit are blocked when they target paths outside configured write roots.
+ * - read/search/list tools are blocked for configured sensitive paths.
+ * - /sandbox shows or toggles runtime sandbox state in the Pi TUI.
  */
 
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
@@ -24,21 +24,44 @@ import {
 	type ToolResultEvent,
 	type ToolResultEventResult,
 	type UserBashEventResult,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 export interface SandboxState {
 	enabled: boolean;
+	config: SandboxExtensionConfig;
+	configSource: string;
 }
 
-const DEFAULT_STATE: SandboxState = { enabled: true };
-const DENY_READ_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"];
-const DENY_WRITE_LABELS = [".env", ".env.*", "*.pem", "*.key"];
-const DENY_WRITE_PATTERNS = [/^\.env(?:\..*)?$/i, /\.pem$/i, /\.key$/i];
+export interface SandboxExtensionConfig {
+	filesystem: {
+		denyRead: string[];
+		allowWrite: string[];
+		denyWrite: string[];
+	};
+}
+
+const DEFAULT_CONFIG: SandboxExtensionConfig = {
+	filesystem: {
+		denyRead: ["~/.ssh", "~/.aws", "~/.gnupg"],
+		allowWrite: [".", "/tmp", "/private/tmp"],
+		denyWrite: ["**/.env", "**/.env.*", "**/*.pem", "**/*.key"],
+	},
+};
+
+const DEFAULT_STATE: SandboxState = {
+	enabled: true,
+	config: DEFAULT_CONFIG,
+	configSource: "default",
+};
 
 function expandHome(value: string): string {
 	if (value === "~") return os.homedir();
 	if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
 	return value;
+}
+
+function resolveConfigPath(cwd: string, value: string): string {
+	return path.resolve(cwd, expandHome(value));
 }
 
 function absolutePath(cwd: string, value: string): string {
@@ -58,33 +81,64 @@ function allowedTempRoots(): string[] {
 	return [...new Set(roots.map((root) => path.resolve(root)))];
 }
 
-function tempRootsText(): string {
-	return allowedTempRoots().join(", ");
-}
-
-function filesystemConfig(cwd: string): Partial<SandboxRuntimeConfig>["filesystem"] {
-	const workspace = path.resolve(cwd);
-	const tempRoots = allowedTempRoots();
-	const denyWrite = [
-		"**/.env",
-		"**/.env.*",
-		"**/*.pem",
-		"**/*.key",
-	].flatMap((entry) => [absolutePath(workspace, entry), ...tempRoots.map((root) => absolutePath(root, entry))]);
+function normalizeConfig(value: unknown): SandboxExtensionConfig {
+	const raw = value && typeof value === "object" ? value as Partial<SandboxExtensionConfig> : {};
+	const filesystem = raw.filesystem && typeof raw.filesystem === "object" ? raw.filesystem : {};
 	return {
-		denyRead: DENY_READ_PATHS.map((entry) => absolutePath(cwd, entry)),
-		allowWrite: [workspace, ...tempRoots],
-		denyWrite,
+		filesystem: {
+			denyRead: Array.isArray(filesystem.denyRead) ? filesystem.denyRead.map(String) : [...DEFAULT_CONFIG.filesystem.denyRead],
+			allowWrite: Array.isArray(filesystem.allowWrite) ? filesystem.allowWrite.map(String) : [...DEFAULT_CONFIG.filesystem.allowWrite],
+			denyWrite: Array.isArray(filesystem.denyWrite) ? filesystem.denyWrite.map(String) : [...DEFAULT_CONFIG.filesystem.denyWrite],
+		},
 	};
 }
 
-function runtimeConfig(cwd: string): Partial<SandboxRuntimeConfig> {
-	return { filesystem: filesystemConfig(cwd) };
+function readConfigFile(filePath: string): SandboxExtensionConfig {
+	return normalizeConfig(JSON.parse(fs.readFileSync(filePath, "utf8")));
 }
 
-function denyReadReason(cwd: string, requestedPath: string): string | undefined {
+function findConfig(cwd: string, specificPath?: string): { config: SandboxExtensionConfig; source: string; warning?: string } {
+	const candidates = [
+		specificPath ? { label: "specific", path: resolveConfigPath(cwd, specificPath) } : null,
+		{ label: "project", path: path.join(cwd, ".pi", "sandbox.json") },
+		{ label: "global", path: path.join(os.homedir(), ".pi", "sandbox.json") },
+	].filter((entry): entry is { label: string; path: string } => Boolean(entry));
+
+	for (const candidate of candidates) {
+		if (!fs.existsSync(candidate.path)) continue;
+		try {
+			return { config: readConfigFile(candidate.path), source: `${candidate.label}: ${candidate.path}` };
+		} catch (error) {
+			return {
+				config: DEFAULT_CONFIG,
+				source: "default",
+				warning: `Could not parse sandbox config ${candidate.path}: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+
+	return { config: DEFAULT_CONFIG, source: "default" };
+}
+
+function resolvedFilesystemConfig(cwd: string, config: SandboxExtensionConfig): Required<SandboxExtensionConfig>["filesystem"] {
+	const tempRoots = allowedTempRoots();
+	return {
+		denyRead: config.filesystem.denyRead.map((entry) => absolutePath(cwd, entry)),
+		allowWrite: [...new Set(config.filesystem.allowWrite.map((entry) => absolutePath(cwd, entry)))],
+		denyWrite: config.filesystem.denyWrite.flatMap((entry) => {
+			if (path.isAbsolute(expandHome(entry))) return [absolutePath(cwd, entry)];
+			return [absolutePath(cwd, entry), ...tempRoots.map((root) => absolutePath(root, entry))];
+		}),
+	};
+}
+
+function runtimeConfig(cwd: string, state: SandboxState): Partial<SandboxRuntimeConfig> {
+	return { filesystem: resolvedFilesystemConfig(cwd, state.config) };
+}
+
+function denyReadReason(cwd: string, state: SandboxState, requestedPath: string): string | undefined {
 	const target = absolutePath(cwd, requestedPath || ".");
-	for (const denied of DENY_READ_PATHS) {
+	for (const denied of state.config.filesystem.denyRead) {
 		const deniedPath = absolutePath(cwd, denied);
 		if (isInside(deniedPath, target) || isInside(target, deniedPath)) {
 			return `Sandbox blocked ${requestedPath}: reading ${denied} is not allowed.`;
@@ -93,21 +147,28 @@ function denyReadReason(cwd: string, requestedPath: string): string | undefined 
 	return undefined;
 }
 
-function denyWriteReason(cwd: string, requestedPath: string): string | undefined {
+function globToRegExp(glob: string): RegExp {
+	const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*");
+	return new RegExp(`^${escaped}$`, "i");
+}
+
+function denyWriteReason(cwd: string, state: SandboxState, requestedPath: string): string | undefined {
 	const target = absolutePath(cwd, requestedPath);
-	const workspace = path.resolve(cwd);
-	const tempRoots = allowedTempRoots();
-	const allowed = isInside(workspace, target) || tempRoots.some((root) => isInside(root, target));
+	const allowed = state.config.filesystem.allowWrite.some((root) => isInside(absolutePath(cwd, root), target));
 	if (!allowed) {
 		return [
-			`Sandbox blocked ${requestedPath}: writing outside the workspace or temp directory is not allowed.`,
-			`Workspace: ${workspace}`,
-			`Temp: ${tempRootsText()}`,
+			`Sandbox blocked ${requestedPath}: writing outside allowed directories is not allowed.`,
+			`Allowed write roots: ${state.config.filesystem.allowWrite.join(", ")}`,
 		].join("\n");
 	}
+
+	const relative = path.relative(path.resolve(cwd), target) || path.basename(target);
 	const basename = path.basename(target);
-	if (DENY_WRITE_PATTERNS.some((pattern) => pattern.test(basename))) {
-		return `Sandbox blocked ${requestedPath}: writing ${basename} is not allowed by the sandbox policy.`;
+	for (const denied of state.config.filesystem.denyWrite) {
+		const normalized = denied.replace(/^\*\*\//, "");
+		if (globToRegExp(denied).test(relative) || globToRegExp(normalized).test(basename)) {
+			return `Sandbox blocked ${requestedPath}: writing ${basename} is not allowed by sandbox policy (${denied}).`;
+		}
 	}
 	return undefined;
 }
@@ -123,28 +184,32 @@ function respectfulBlock(reason: string): string {
 
 function statusText(state: SandboxState, cwd?: string): string {
 	const workspace = cwd ? path.resolve(cwd) : "(current workspace)";
+	const fsConfig = cwd ? resolvedFilesystemConfig(cwd, state.config) : null;
 	return [
 		`sandbox: ${state.enabled ? "on" : "off"}`,
+		`config: ${state.configSource}`,
 		"bash: OS sandboxed with filesystem policy; network is unrestricted",
-		`write/edit allowed: ${workspace}, temp dirs (${tempRootsText()})`,
-		`read denied: ${DENY_READ_PATHS.join(", ")}`,
-		`write denied: ${DENY_WRITE_LABELS.join(", ")}`,
+		`workspace: ${workspace}`,
+		`write/edit allowed: ${state.config.filesystem.allowWrite.join(", ")}`,
+		`read denied: ${state.config.filesystem.denyRead.join(", ")}`,
+		`write denied: ${state.config.filesystem.denyWrite.join(", ")}`,
+		...(fsConfig ? [`resolved write roots: ${fsConfig.allowWrite.join(", ")}`] : []),
 	].join("\n");
 }
 
-async function wrapBashCommand(command: string, cwd: string, signal?: AbortSignal): Promise<string> {
-	const wrappedCommand = await SandboxManager.wrapWithSandbox(command, undefined, runtimeConfig(cwd), signal);
+async function wrapBashCommand(command: string, cwd: string, state: SandboxState, signal?: AbortSignal): Promise<string> {
+	const wrappedCommand = await SandboxManager.wrapWithSandbox(command, undefined, runtimeConfig(cwd, state), signal);
 	if (process.platform === "darwin" && wrappedCommand.startsWith("env ")) {
 		return `/usr/bin/${wrappedCommand}`;
 	}
 	return wrappedCommand;
 }
 
-function createSandboxedBashOperations(): BashOperations {
+function createSandboxedBashOperations(state: SandboxState): BashOperations {
 	const local = createLocalBashOperations();
 	return {
 		async exec(command, cwd, options) {
-			const wrappedCommand = await wrapBashCommand(command, cwd, options.signal);
+			const wrappedCommand = await wrapBashCommand(command, cwd, state, options.signal);
 			return local.exec(wrappedCommand, cwd, options);
 		},
 	};
@@ -161,17 +226,17 @@ function looksLikeSandboxFailure(text: string): boolean {
 	return /operation not permitted|permission denied|sandbox|not allowed|blocked/i.test(text);
 }
 
-function blockForFileTool(event: ToolCallEvent, ctx: ExtensionContext): ToolCallEventResult | undefined {
+function blockForFileTool(event: ToolCallEvent, ctx: ExtensionContext, state: SandboxState): ToolCallEventResult | undefined {
 	if (event.toolName === "write" || event.toolName === "edit") {
 		const targetPath = typeof event.input.path === "string" ? event.input.path : "";
 		if (!targetPath) return undefined;
-		const reason = denyWriteReason(ctx.cwd, targetPath);
+		const reason = denyWriteReason(ctx.cwd, state, targetPath);
 		return reason ? { block: true, reason: respectfulBlock(reason) } : undefined;
 	}
 
 	if (event.toolName === "read" || event.toolName === "grep" || event.toolName === "find" || event.toolName === "ls") {
 		const targetPath = typeof event.input.path === "string" ? event.input.path : ".";
-		const reason = denyReadReason(ctx.cwd, targetPath);
+		const reason = denyReadReason(ctx.cwd, state, targetPath);
 		return reason ? { block: true, reason: respectfulBlock(reason) } : undefined;
 	}
 
@@ -179,32 +244,61 @@ function blockForFileTool(event: ToolCallEvent, ctx: ExtensionContext): ToolCall
 }
 
 function updateStatus(ctx: ExtensionContext, state: SandboxState): void {
-	ctx.ui.setStatus("sandbox", `sandbox:${state.enabled ? "on" : "off"}`);
+	ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("dim", `sandbox ${state.enabled ? "on" : "off"}`));
 }
 
 export function createSandboxState(enabled = true): SandboxState {
-	return { enabled };
+	return { enabled, config: DEFAULT_CONFIG, configSource: "default" };
+}
+
+function applyStartupFlags(pi: ExtensionAPI, ctx: ExtensionContext, state: SandboxState): void {
+	const sandboxFlag = String(pi.getFlag("sandbox") ?? "on").trim().toLowerCase();
+	if (sandboxFlag === "on" || sandboxFlag === "off") {
+		state.enabled = sandboxFlag === "on";
+	} else {
+		ctx.ui.notify(`Invalid --sandbox value "${sandboxFlag}". Use --sandbox on or --sandbox off.`, "warning");
+		state.enabled = true;
+	}
+
+	const configFlag = pi.getFlag("sandbox-config");
+	const configPath = typeof configFlag === "string" ? configFlag : undefined;
+	const loaded = findConfig(ctx.cwd, configPath);
+	state.config = loaded.config;
+	state.configSource = loaded.source;
+	if (loaded.warning) ctx.ui.notify(loaded.warning, "warning");
 }
 
 export function createSandboxExtension(state: SandboxState = DEFAULT_STATE) {
 	return function sandboxExtension(pi: ExtensionAPI) {
 		const sandboxedToolCalls = new Set<string>();
 
+		pi.registerFlag("sandbox", {
+			description: "Set sandbox state: on or off",
+			type: "string",
+			default: "on",
+		});
+
+		pi.registerFlag("sandbox-config", {
+			description: "Path to sandbox config JSON",
+			type: "string",
+		});
+
 		pi.on("session_start", (_event, ctx) => {
+			applyStartupFlags(pi, ctx, state);
 			updateStatus(ctx, state);
 		});
 
 		pi.on("tool_call", async (event, ctx) => {
 			if (!state.enabled) return undefined;
 
-			const fileBlock = blockForFileTool(event, ctx);
+			const fileBlock = blockForFileTool(event, ctx, state);
 			if (fileBlock) return fileBlock;
 
 			if (event.toolName !== "bash") return undefined;
 			if (typeof event.input.command !== "string") return undefined;
 
 			try {
-				event.input.command = await wrapBashCommand(event.input.command, ctx.cwd, ctx.signal);
+				event.input.command = await wrapBashCommand(event.input.command, ctx.cwd, state, ctx.signal);
 				sandboxedToolCalls.add(event.toolCallId);
 				return undefined;
 			} catch (error) {
@@ -229,7 +323,7 @@ export function createSandboxExtension(state: SandboxState = DEFAULT_STATE) {
 
 		pi.on("user_bash", (): UserBashEventResult | undefined => {
 			if (!state.enabled) return undefined;
-			return { operations: createSandboxedBashOperations() };
+			return { operations: createSandboxedBashOperations(state) };
 		});
 
 		pi.registerCommand("sandbox", {

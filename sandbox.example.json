@@ -1,0 +1,7 @@
+{
+  "filesystem": {
+    "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg"],
+    "allowWrite": [".", "/tmp", "/private/tmp"],
+    "denyWrite": ["**/.env", "**/.env.*", "**/*.pem", "**/*.key"]
+  }
+}
