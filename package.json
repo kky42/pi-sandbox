@@ -1,0 +1,24 @@
+{
+  "name": "@kky42/pi-sandbox",
+  "version": "1.3.0",
+  "description": "Pi-compatible sandbox extension for filesystem-aware bash and tool enforcement",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.26"
+  }
+}
