@@ -60,6 +60,20 @@ The extension loads the first existing config file in this priority order:
 
 See [`sandbox.example.json`](./sandbox.example.json) for the default config shape.
 
+## Platform support
+
+- macOS: supported.
+- Linux: supported when `bubblewrap`, `socat`, and `ripgrep` are installed.
+- Windows: not supported for bash sandboxing.
+
+On Linux, install requirements with your OS package manager, for example:
+
+```bash
+sudo apt install bubblewrap socat ripgrep
+```
+
+When sandboxing is unavailable and sandbox is on, bash commands are blocked. Run `/sandbox off` or start with `--sandbox off` only if you want to allow unsandboxed bash.
+
 ## Default behavior
 
 - `bash` commands are wrapped with `@anthropic-ai/sandbox-runtime` filesystem policy.
