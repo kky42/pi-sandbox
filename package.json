@@ -1,6 +1,6 @@
 {
   "name": "@kky42/pi-sandbox",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pi-compatible sandbox extension for filesystem-aware bash and tool enforcement",
   "type": "module",
   "keywords": [

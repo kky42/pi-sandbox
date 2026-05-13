@@ -27,10 +27,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 export interface SandboxState {
+	mode?: SandboxMode;
 	enabled: boolean;
 	config: SandboxExtensionConfig;
 	configSource: string;
 }
+
+export type SandboxMode = "readonly" | "on" | "off";
 
 export interface SandboxExtensionConfig {
 	filesystem: {
@@ -49,10 +52,25 @@ const DEFAULT_CONFIG: SandboxExtensionConfig = {
 };
 
 const DEFAULT_STATE: SandboxState = {
+	mode: "on",
 	enabled: true,
 	config: DEFAULT_CONFIG,
 	configSource: "default",
 };
+
+function setSandboxMode(state: SandboxState, mode: SandboxMode): void {
+	state.mode = mode;
+	state.enabled = mode !== "off";
+}
+
+function sandboxMode(state: SandboxState): SandboxMode {
+	return state.mode ?? (state.enabled ? "on" : "off");
+}
+
+function sandboxModeFromValue(value: string): SandboxMode | undefined {
+	if (value === "readonly" || value === "on" || value === "off") return value;
+	return undefined;
+}
 
 function expandHome(value: string): string {
 	if (value === "~") return os.homedir();
@@ -132,8 +150,14 @@ function resolvedFilesystemConfig(cwd: string, config: SandboxExtensionConfig): 
 	};
 }
 
+function effectiveFilesystemConfig(cwd: string, state: SandboxState): Required<SandboxExtensionConfig>["filesystem"] {
+	const filesystem = resolvedFilesystemConfig(cwd, state.config);
+	if (sandboxMode(state) !== "readonly") return filesystem;
+	return { ...filesystem, allowWrite: [] };
+}
+
 function runtimeConfig(cwd: string, state: SandboxState): Partial<SandboxRuntimeConfig> {
-	return { filesystem: resolvedFilesystemConfig(cwd, state.config) };
+	return { filesystem: effectiveFilesystemConfig(cwd, state) };
 }
 
 function denyReadReason(cwd: string, state: SandboxState, requestedPath: string): string | undefined {
@@ -153,6 +177,10 @@ function globToRegExp(glob: string): RegExp {
 }
 
 function denyWriteReason(cwd: string, state: SandboxState, requestedPath: string): string | undefined {
+	if (sandboxMode(state) === "readonly") {
+		return `Sandbox blocked ${requestedPath}: readonly mode does not allow writes.`;
+	}
+
 	const target = absolutePath(cwd, requestedPath);
 	const allowed = state.config.filesystem.allowWrite.some((root) => isInside(absolutePath(cwd, root), target));
 	if (!allowed) {
@@ -183,14 +211,15 @@ function respectfulBlock(reason: string): string {
 }
 
 function statusText(state: SandboxState, cwd?: string): string {
+	const mode = sandboxMode(state);
 	const workspace = cwd ? path.resolve(cwd) : "(current workspace)";
-	const fsConfig = cwd ? resolvedFilesystemConfig(cwd, state.config) : null;
+	const fsConfig = cwd && state.enabled ? effectiveFilesystemConfig(cwd, state) : null;
 	return [
-		`sandbox: ${state.enabled ? "on" : "off"}`,
+		`sandbox: ${mode}`,
 		`config: ${state.configSource}`,
-		"bash: OS sandboxed with filesystem policy; network is unrestricted",
+		`bash: ${state.enabled ? "OS sandboxed with filesystem policy; network is unrestricted" : "unsandboxed"}`,
 		`workspace: ${workspace}`,
-		`write/edit allowed: ${state.config.filesystem.allowWrite.join(", ")}`,
+		`write/edit allowed: ${mode === "readonly" ? "(none; readonly mode)" : state.config.filesystem.allowWrite.join(", ")}`,
 		`read denied: ${state.config.filesystem.denyRead.join(", ")}`,
 		`write denied: ${state.config.filesystem.denyWrite.join(", ")}`,
 		...(fsConfig ? [`resolved write roots: ${fsConfig.allowWrite.join(", ")}`] : []),
@@ -244,20 +273,21 @@ function blockForFileTool(event: ToolCallEvent, ctx: ExtensionContext, state: Sa
 }
 
 function updateStatus(ctx: ExtensionContext, state: SandboxState): void {
-	ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("dim", `sandbox ${state.enabled ? "on" : "off"}`));
+	ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("dim", `sandbox ${sandboxMode(state)}`));
 }
 
 export function createSandboxState(enabled = true): SandboxState {
-	return { enabled, config: DEFAULT_CONFIG, configSource: "default" };
+	return { mode: enabled ? "on" : "off", enabled, config: DEFAULT_CONFIG, configSource: "default" };
 }
 
 function applyStartupFlags(pi: ExtensionAPI, ctx: ExtensionContext, state: SandboxState): void {
 	const sandboxFlag = String(pi.getFlag("sandbox") ?? "on").trim().toLowerCase();
-	if (sandboxFlag === "on" || sandboxFlag === "off") {
-		state.enabled = sandboxFlag === "on";
+	const mode = sandboxModeFromValue(sandboxFlag);
+	if (mode) {
+		setSandboxMode(state, mode);
 	} else {
-		ctx.ui.notify(`Invalid --sandbox value "${sandboxFlag}". Use --sandbox on or --sandbox off.`, "warning");
-		state.enabled = true;
+		ctx.ui.notify(`Invalid --sandbox value "${sandboxFlag}". Use --sandbox readonly, --sandbox on, or --sandbox off.`, "warning");
+		setSandboxMode(state, "on");
 	}
 
 	const configFlag = pi.getFlag("sandbox-config");
@@ -273,7 +303,7 @@ export function createSandboxExtension(state: SandboxState = DEFAULT_STATE) {
 		const sandboxedToolCalls = new Set<string>();
 
 		pi.registerFlag("sandbox", {
-			description: "Set sandbox state: on or off",
+			description: "Set sandbox mode: readonly, on, or off",
 			type: "string",
 			default: "on",
 		});
@@ -335,15 +365,16 @@ export function createSandboxExtension(state: SandboxState = DEFAULT_STATE) {
 					updateStatus(ctx, state);
 					return;
 				}
-				if (value !== "on" && value !== "off") {
-					ctx.ui.notify("Usage: /sandbox [on|off]", "warning");
+				const mode = sandboxModeFromValue(value);
+				if (!mode) {
+					ctx.ui.notify("Usage: /sandbox [readonly|on|off]", "warning");
 					return;
 				}
 				if (!ctx.isIdle()) {
 					ctx.ui.notify("Cannot change sandbox while a Pi turn is running. Run /sandbox again after the turn finishes.", "warning");
 					return;
 				}
-				state.enabled = value === "on";
+				setSandboxMode(state, mode);
 				updateStatus(ctx, state);
 				ctx.ui.notify(statusText(state, ctx.cwd), "info");
 			},
