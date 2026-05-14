@@ -1,4 +1,5 @@
 {
+  "_comment": "Complete custom policy for pi --sandbox-config ./sandbox.example.json. Built-in choices are read-only, workspace-write, and danger-full-access.",
   "filesystem": {
     "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg"],
     "allowWrite": [".", "/tmp", "/private/tmp"],

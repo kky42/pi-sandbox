@@ -22,25 +22,39 @@ import {
 	type ToolCallEvent,
 	type ToolCallEventResult,
 	type ToolResultEvent,
-	type ToolResultEventResult,
 	type UserBashEventResult,
 } from "@earendil-works/pi-coding-agent";
 
 export interface SandboxState {
-	mode?: SandboxMode;
+	choice: SandboxChoice;
 	enabled: boolean;
 	config: SandboxExtensionConfig;
 	configSource: string;
+	startupConfig?: SandboxStartupConfig;
 }
 
-export type SandboxMode = "readonly" | "on" | "off";
+export type BuiltinSandboxChoice = "read-only" | "workspace-write" | "danger-full-access";
+export type SandboxChoice = BuiltinSandboxChoice | "config";
+
+export interface SandboxStartupConfig {
+	config: SandboxExtensionConfig;
+	path: string;
+	source: string;
+}
 
 export interface SandboxExtensionConfig {
 	filesystem: {
 		denyRead: string[];
 		allowWrite: string[];
 		denyWrite: string[];
+		allowGitConfig?: boolean;
 	};
+}
+
+interface SandboxToolResultEventResult {
+	content?: ToolResultEvent["content"];
+	details?: unknown;
+	isError?: boolean;
 }
 
 const DEFAULT_CONFIG: SandboxExtensionConfig = {
@@ -51,24 +65,46 @@ const DEFAULT_CONFIG: SandboxExtensionConfig = {
 	},
 };
 
-const DEFAULT_STATE: SandboxState = {
-	mode: "on",
-	enabled: true,
-	config: DEFAULT_CONFIG,
-	configSource: "default",
-};
+const BUILTIN_SANDBOX_CHOICES: BuiltinSandboxChoice[] = ["read-only", "workspace-write", "danger-full-access"];
+const SANDBOX_USAGE = "read-only|workspace-write|danger-full-access|config";
 
-function setSandboxMode(state: SandboxState, mode: SandboxMode): void {
-	state.mode = mode;
-	state.enabled = mode !== "off";
+function cloneConfig(config: SandboxExtensionConfig): SandboxExtensionConfig {
+	const filesystem: SandboxExtensionConfig["filesystem"] = {
+		denyRead: [...config.filesystem.denyRead],
+		allowWrite: [...config.filesystem.allowWrite],
+		denyWrite: [...config.filesystem.denyWrite],
+	};
+	if (typeof config.filesystem.allowGitConfig === "boolean") {
+		filesystem.allowGitConfig = config.filesystem.allowGitConfig;
+	}
+	return { filesystem };
 }
 
-function sandboxMode(state: SandboxState): SandboxMode {
-	return state.mode ?? (state.enabled ? "on" : "off");
+function setBuiltinSandboxChoice(state: SandboxState, choice: BuiltinSandboxChoice): void {
+	state.choice = choice;
+	state.enabled = choice !== "danger-full-access";
+	state.config = cloneConfig(DEFAULT_CONFIG);
+	state.configSource = `built-in: ${choice}`;
 }
 
-function sandboxModeFromValue(value: string): SandboxMode | undefined {
-	if (value === "readonly" || value === "on" || value === "off") return value;
+function setConfigSandboxChoice(state: SandboxState, startupConfig: SandboxStartupConfig): void {
+	state.choice = "config";
+	state.enabled = true;
+	state.config = cloneConfig(startupConfig.config);
+	state.configSource = startupConfig.source;
+	state.startupConfig = {
+		config: cloneConfig(startupConfig.config),
+		path: startupConfig.path,
+		source: startupConfig.source,
+	};
+}
+
+export function sandboxChoice(state: SandboxState): SandboxChoice {
+	return state.choice ?? (state.enabled ? "workspace-write" : "danger-full-access");
+}
+
+export function sandboxChoiceFromValue(value: string): BuiltinSandboxChoice | undefined {
+	if (BUILTIN_SANDBOX_CHOICES.includes(value as BuiltinSandboxChoice)) return value as BuiltinSandboxChoice;
 	return undefined;
 }
 
@@ -99,48 +135,68 @@ function allowedTempRoots(): string[] {
 	return [...new Set(roots.map((root) => path.resolve(root)))];
 }
 
-function normalizeConfig(value: unknown): SandboxExtensionConfig {
-	const raw = value && typeof value === "object" ? value as Partial<SandboxExtensionConfig> : {};
-	const filesystem = raw.filesystem && typeof raw.filesystem === "object" ? raw.filesystem : {};
-	return {
-		filesystem: {
-			denyRead: Array.isArray(filesystem.denyRead) ? filesystem.denyRead.map(String) : [...DEFAULT_CONFIG.filesystem.denyRead],
-			allowWrite: Array.isArray(filesystem.allowWrite) ? filesystem.allowWrite.map(String) : [...DEFAULT_CONFIG.filesystem.allowWrite],
-			denyWrite: Array.isArray(filesystem.denyWrite) ? filesystem.denyWrite.map(String) : [...DEFAULT_CONFIG.filesystem.denyWrite],
-		},
+function requireStringArray(value: unknown, name: string): string[] {
+	if (!Array.isArray(value)) {
+		throw new Error(`${name} must be an array of strings`);
+	}
+	const invalid = value.find((entry) => typeof entry !== "string" || entry.length === 0);
+	if (invalid !== undefined) {
+		throw new Error(`${name} must contain only non-empty strings`);
+	}
+	return [...value];
+}
+
+export function parseConfig(value: unknown): SandboxExtensionConfig {
+	if (!value || typeof value !== "object") {
+		throw new Error("config must be an object");
+	}
+	const filesystem = (value as Partial<SandboxExtensionConfig>).filesystem;
+	if (!filesystem || typeof filesystem !== "object") {
+		throw new Error("filesystem must be an object");
+	}
+
+	const parsedFilesystem: SandboxExtensionConfig["filesystem"] = {
+		denyRead: requireStringArray(filesystem.denyRead, "filesystem.denyRead"),
+		allowWrite: requireStringArray(filesystem.allowWrite, "filesystem.allowWrite"),
+		denyWrite: requireStringArray(filesystem.denyWrite, "filesystem.denyWrite"),
 	};
+	if (filesystem.allowGitConfig !== undefined) {
+		if (typeof filesystem.allowGitConfig !== "boolean") {
+			throw new Error("filesystem.allowGitConfig must be a boolean when provided");
+		}
+		parsedFilesystem.allowGitConfig = filesystem.allowGitConfig;
+	}
+	return { filesystem: parsedFilesystem };
 }
 
 function readConfigFile(filePath: string): SandboxExtensionConfig {
-	return normalizeConfig(JSON.parse(fs.readFileSync(filePath, "utf8")));
+	return parseConfig(JSON.parse(fs.readFileSync(filePath, "utf8")));
 }
 
-function findConfig(cwd: string, specificPath?: string): { config: SandboxExtensionConfig; source: string; warning?: string } {
-	const candidates = [
-		specificPath ? { label: "specific", path: resolveConfigPath(cwd, specificPath) } : null,
-		{ label: "project", path: path.join(cwd, ".pi", "sandbox.json") },
-		{ label: "global", path: path.join(os.homedir(), ".pi", "sandbox.json") },
-	].filter((entry): entry is { label: string; path: string } => Boolean(entry));
-
-	for (const candidate of candidates) {
-		if (!fs.existsSync(candidate.path)) continue;
-		try {
-			return { config: readConfigFile(candidate.path), source: `${candidate.label}: ${candidate.path}` };
-		} catch (error) {
-			return {
-				config: DEFAULT_CONFIG,
-				source: "default",
-				warning: `Could not parse sandbox config ${candidate.path}: ${error instanceof Error ? error.message : String(error)}`,
-			};
+function loadExplicitConfig(cwd: string, configPath: string): { startupConfig?: SandboxStartupConfig; warning?: string } {
+	const resolvedPath = resolveConfigPath(cwd, configPath);
+	try {
+		if (!fs.existsSync(resolvedPath)) {
+			throw new Error("file does not exist");
 		}
+		const config = readConfigFile(resolvedPath);
+		return {
+			startupConfig: {
+				config,
+				path: resolvedPath,
+				source: `--sandbox-config: ${resolvedPath}`,
+			},
+		};
+	} catch (error) {
+		return {
+			warning: `Invalid sandbox config ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`,
+		};
 	}
-
-	return { config: DEFAULT_CONFIG, source: "default" };
 }
 
 function resolvedFilesystemConfig(cwd: string, config: SandboxExtensionConfig): Required<SandboxExtensionConfig>["filesystem"] {
 	const tempRoots = allowedTempRoots();
-	return {
+	const filesystem: Required<SandboxExtensionConfig>["filesystem"] = {
 		denyRead: config.filesystem.denyRead.map((entry) => absolutePath(cwd, entry)),
 		allowWrite: [...new Set(config.filesystem.allowWrite.map((entry) => absolutePath(cwd, entry)))],
 		denyWrite: config.filesystem.denyWrite.flatMap((entry) => {
@@ -148,11 +204,15 @@ function resolvedFilesystemConfig(cwd: string, config: SandboxExtensionConfig): 
 			return [absolutePath(cwd, entry), ...tempRoots.map((root) => absolutePath(root, entry))];
 		}),
 	};
+	if (typeof config.filesystem.allowGitConfig === "boolean") {
+		filesystem.allowGitConfig = config.filesystem.allowGitConfig;
+	}
+	return filesystem;
 }
 
-function effectiveFilesystemConfig(cwd: string, state: SandboxState): Required<SandboxExtensionConfig>["filesystem"] {
+export function effectiveFilesystemConfig(cwd: string, state: SandboxState): Required<SandboxExtensionConfig>["filesystem"] {
 	const filesystem = resolvedFilesystemConfig(cwd, state.config);
-	if (sandboxMode(state) !== "readonly") return filesystem;
+	if (sandboxChoice(state) !== "read-only") return filesystem;
 	return { ...filesystem, allowWrite: [] };
 }
 
@@ -176,9 +236,9 @@ function globToRegExp(glob: string): RegExp {
 	return new RegExp(`^${escaped}$`, "i");
 }
 
-function denyWriteReason(cwd: string, state: SandboxState, requestedPath: string): string | undefined {
-	if (sandboxMode(state) === "readonly") {
-		return `Sandbox blocked ${requestedPath}: readonly mode does not allow writes.`;
+export function denyWriteReason(cwd: string, state: SandboxState, requestedPath: string): string | undefined {
+	if (sandboxChoice(state) === "read-only") {
+		return `Sandbox blocked ${requestedPath}: read-only sandbox does not allow writes.`;
 	}
 
 	const target = absolutePath(cwd, requestedPath);
@@ -206,23 +266,35 @@ function respectfulBlock(reason: string): string {
 		reason,
 		"",
 		"Respect the sandbox. Do not try alternate tools, shell tricks, or path changes to bypass it.",
-		"Ask the user to run /sandbox off if this operation should be allowed.",
+		"Ask the user to run /sandbox danger-full-access if this operation should be allowed.",
 	].join("\n");
 }
 
-function statusText(state: SandboxState, cwd?: string): string {
-	const mode = sandboxMode(state);
+export function statusText(state: SandboxState, cwd?: string): string {
+	const choice = sandboxChoice(state);
 	const workspace = cwd ? path.resolve(cwd) : "(current workspace)";
 	const fsConfig = cwd && state.enabled ? effectiveFilesystemConfig(cwd, state) : null;
+	const writeAllowed = state.enabled
+		? choice === "read-only"
+			? "(none; read-only sandbox)"
+			: state.config.filesystem.allowWrite.join(", ")
+		: "(unrestricted; sandbox disabled)";
+	const readDenied = state.enabled ? state.config.filesystem.denyRead.join(", ") : "(none; sandbox disabled)";
+	const writeDenied = state.enabled ? state.config.filesystem.denyWrite.join(", ") : "(none; sandbox disabled)";
+	const restoreHint =
+		state.startupConfig && choice !== "config"
+			? [`restore custom config: /sandbox config (${state.startupConfig.path})`]
+			: [];
 	return [
-		`sandbox: ${mode}`,
-		`config: ${state.configSource}`,
+		`sandbox: ${choice}`,
+		`policy source: ${state.configSource}`,
 		`bash: ${state.enabled ? "OS sandboxed with filesystem policy; network is unrestricted" : "unsandboxed"}`,
 		`workspace: ${workspace}`,
-		`write/edit allowed: ${mode === "readonly" ? "(none; readonly mode)" : state.config.filesystem.allowWrite.join(", ")}`,
-		`read denied: ${state.config.filesystem.denyRead.join(", ")}`,
-		`write denied: ${state.config.filesystem.denyWrite.join(", ")}`,
+		`write/edit allowed: ${writeAllowed}`,
+		`read denied: ${readDenied}`,
+		`write denied: ${writeDenied}`,
 		...(fsConfig ? [`resolved write roots: ${fsConfig.allowWrite.join(", ")}`] : []),
+		...restoreHint,
 	].join("\n");
 }
 
@@ -273,43 +345,67 @@ function blockForFileTool(event: ToolCallEvent, ctx: ExtensionContext, state: Sa
 }
 
 function updateStatus(ctx: ExtensionContext, state: SandboxState): void {
-	ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("dim", `sandbox ${sandboxMode(state)}`));
+	ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("dim", `sandbox ${sandboxChoice(state)}`));
 }
 
 export function createSandboxState(enabled = true): SandboxState {
-	return { mode: enabled ? "on" : "off", enabled, config: DEFAULT_CONFIG, configSource: "default" };
+	const choice: BuiltinSandboxChoice = enabled ? "workspace-write" : "danger-full-access";
+	return {
+		choice,
+		enabled,
+		config: cloneConfig(DEFAULT_CONFIG),
+		configSource: `built-in: ${choice}`,
+	};
 }
 
 function applyStartupFlags(pi: ExtensionAPI, ctx: ExtensionContext, state: SandboxState): void {
-	const sandboxFlag = String(pi.getFlag("sandbox") ?? "on").trim().toLowerCase();
-	const mode = sandboxModeFromValue(sandboxFlag);
-	if (mode) {
-		setSandboxMode(state, mode);
-	} else {
-		ctx.ui.notify(`Invalid --sandbox value "${sandboxFlag}". Use --sandbox readonly, --sandbox on, or --sandbox off.`, "warning");
-		setSandboxMode(state, "on");
-	}
-
 	const configFlag = pi.getFlag("sandbox-config");
 	const configPath = typeof configFlag === "string" ? configFlag : undefined;
-	const loaded = findConfig(ctx.cwd, configPath);
-	state.config = loaded.config;
-	state.configSource = loaded.source;
-	if (loaded.warning) ctx.ui.notify(loaded.warning, "warning");
+	const sandboxFlag = pi.getFlag("sandbox");
+	const sandboxValue = typeof sandboxFlag === "string" ? sandboxFlag.trim().toLowerCase() : undefined;
+
+	if (configPath) {
+		if (sandboxValue) {
+			ctx.ui.notify(`Ignoring --sandbox ${sandboxValue} because --sandbox-config was provided.`, "warning");
+		}
+		const loaded = loadExplicitConfig(ctx.cwd, configPath);
+		if (loaded.startupConfig) {
+			setConfigSandboxChoice(state, loaded.startupConfig);
+			return;
+		}
+		if (loaded.warning) {
+			ctx.ui.notify(`${loaded.warning}. Falling back to --sandbox workspace-write.`, "warning");
+		}
+		setBuiltinSandboxChoice(state, "workspace-write");
+		return;
+	}
+
+	if (!sandboxValue) {
+		setBuiltinSandboxChoice(state, "workspace-write");
+		return;
+	}
+
+	const choice = sandboxChoiceFromValue(sandboxValue);
+	if (choice) {
+		setBuiltinSandboxChoice(state, choice);
+		return;
+	}
+
+	ctx.ui.notify(`Invalid --sandbox value "${sandboxValue}". Usage: --sandbox ${BUILTIN_SANDBOX_CHOICES.join("|")}.`, "warning");
+	setBuiltinSandboxChoice(state, "workspace-write");
 }
 
-export function createSandboxExtension(state: SandboxState = DEFAULT_STATE) {
+export function createSandboxExtension(state: SandboxState = createSandboxState(true)) {
 	return function sandboxExtension(pi: ExtensionAPI) {
 		const sandboxedToolCalls = new Set<string>();
 
 		pi.registerFlag("sandbox", {
-			description: "Set sandbox mode: readonly, on, or off",
+			description: "Set sandbox choice: read-only, workspace-write, or danger-full-access",
 			type: "string",
-			default: "on",
 		});
 
 		pi.registerFlag("sandbox-config", {
-			description: "Path to sandbox config JSON",
+			description: "Path to complete sandbox config JSON",
 			type: "string",
 		});
 
@@ -337,7 +433,7 @@ export function createSandboxExtension(state: SandboxState = DEFAULT_STATE) {
 			}
 		});
 
-		pi.on("tool_result", (event): ToolResultEventResult | undefined => {
+		pi.on("tool_result", (event): SandboxToolResultEventResult | undefined => {
 			if (!state.enabled || event.toolName !== "bash" || !sandboxedToolCalls.has(event.toolCallId)) {
 				return undefined;
 			}
@@ -365,16 +461,25 @@ export function createSandboxExtension(state: SandboxState = DEFAULT_STATE) {
 					updateStatus(ctx, state);
 					return;
 				}
-				const mode = sandboxModeFromValue(value);
-				if (!mode) {
-					ctx.ui.notify("Usage: /sandbox [readonly|on|off]", "warning");
+				const builtinChoice = sandboxChoiceFromValue(value);
+				if (!builtinChoice && value !== "config") {
+					ctx.ui.notify(`Usage: /sandbox [${SANDBOX_USAGE}]`, "warning");
 					return;
 				}
 				if (!ctx.isIdle()) {
 					ctx.ui.notify("Cannot change sandbox while a Pi turn is running. Run /sandbox again after the turn finishes.", "warning");
 					return;
 				}
-				setSandboxMode(state, mode);
+				if (builtinChoice) {
+					setBuiltinSandboxChoice(state, builtinChoice);
+				} else {
+					if (!state.startupConfig) {
+						ctx.ui.notify("No startup --sandbox-config is available. Sandbox unchanged.", "warning");
+						updateStatus(ctx, state);
+						return;
+					}
+					setConfigSandboxChoice(state, state.startupConfig);
+				}
 				updateStatus(ctx, state);
 				ctx.ui.notify(statusText(state, ctx.cwd), "info");
 			},
